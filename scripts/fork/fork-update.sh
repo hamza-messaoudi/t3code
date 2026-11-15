@@ -93,6 +93,7 @@ cmd_build() {
 }
 
 cmd_install() {
+  trap "" HUP TERM INT
   local app="${1:?usage: install APP [PID]}" pid="${2:-}"
   [[ -d "$app" ]] || fail "no app at $app"
   if [[ -n "$pid" ]]; then

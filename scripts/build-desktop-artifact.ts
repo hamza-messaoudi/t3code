@@ -60,11 +60,13 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { Command, Flag } from "effect/cli";
-import { FORK_APP_ID, isForkDesktopVersion } from "../apps/desktop/src/fork/forkBuild.ts";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 const LINUX_ICON_SIZES = [16, 22, 24, 32, 48, 64, 128, 256, 512] as const;
 const DESKTOP_APP_ID = "com.t3tools.t3code";
+// Keep in sync with apps/desktop/src/fork/forkBuild.ts.
+const FORK_APP_ID = "com.t3tools.t3code.fork";
+const isForkDesktopVersion = (version: string) => /^[^-+]+-fork\.g[0-9a-f]{7,40}$/.test(version);
 const APPLE_TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/u;
 
 const BuildPlatform = Schema.Literals(["mac", "linux", "win"]);
@@ -2874,16 +2876,16 @@ export const createBuildConfig = Effect.fn("createBuildConfig")(function* (
       protocols: isForkDesktopVersion(version)
         ? []
         : [
-        {
-          name: "T3 Code",
-          schemes: ["t3code", "t3code-dev"],
-        },
-        {
-          name: "Web site URL",
-          schemes: ["http", "https"],
-          role: "Viewer",
-        },
-      ],
+            {
+              name: "T3 Code",
+              schemes: ["t3code", "t3code-dev"],
+            },
+            {
+              name: "Web site URL",
+              schemes: ["http", "https"],
+              role: "Viewer",
+            },
+          ],
       ...(signed ? { sign: path.join(repoRoot, "scripts/sign-macos.ts") } : {}),
       ...(macPasskeySigning
         ? {

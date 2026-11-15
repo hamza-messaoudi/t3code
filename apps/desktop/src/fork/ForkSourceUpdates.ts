@@ -5,11 +5,9 @@
  *
  * @module ForkSourceUpdates
  */
-import * as NodeChildProcess from "node:child_process";
-import * as NodeReadline from "node:readline";
-
 import type { DesktopUpdateState } from "@t3tools/contracts";
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
+import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -20,6 +18,7 @@ import * as Ref from "effect/Ref";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopObservability from "../app/DesktopObservability.ts";
@@ -58,6 +57,7 @@ const make = Effect.gen(function* () {
   const electronApp = yield* ElectronApp.ElectronApp;
   const desktopState = yield* DesktopState.DesktopState;
   const fileSystem = yield* FileSystem.FileSystem;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const path = environment.path;
 
   const source = yield* fileSystem
@@ -89,37 +89,62 @@ const make = Effect.gen(function* () {
       Effect.tap(() => emitState),
     );
 
-  const runScript = (args: ReadonlyArray<string>, onLine?: (line: string) => void) =>
-    Effect.callback<ScriptResult>((resume) => {
-      if (Option.isNone(scriptPath) || Option.isNone(source)) {
-        resume(Effect.succeed({ code: -1, lines: [], error: disabledMessage }));
-        return;
-      }
-      const lines: string[] = [];
-      let error: string | null = null;
-      const child = NodeChildProcess.spawn("/bin/bash", [scriptPath.value, ...args], {
-        cwd: source.value.repo,
-        env: { ...process.env, T3_FORK_BRANCH: source.value.branch, T3_FORK_HOME: environment.baseDir },
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      NodeReadline.createInterface({ input: child.stdout }).on("line", (line) => {
-        lines.push(line);
-        onLine?.(line);
-      });
-      NodeReadline.createInterface({ input: child.stderr }).on("line", (line) => {
-        if (line.startsWith("ERROR ")) error = line.slice("ERROR ".length);
-      });
-      child.on("error", (cause) => resume(Effect.succeed({ code: -1, lines, error: cause.message })));
-      child.on("close", (code) => resume(Effect.succeed({ code: code ?? -1, lines, error })));
-      return Effect.sync(() => child.kill());
+  const scriptEnv = (repoBranch: string) => ({
+    T3_FORK_BRANCH: repoBranch,
+    T3_FORK_HOME: environment.baseDir,
+  });
+
+  const runScript = Effect.fn("ForkSourceUpdates.runScript")(function* (
+    args: ReadonlyArray<string>,
+    onLine?: (line: string) => Effect.Effect<void>,
+  ) {
+    if (Option.isNone(scriptPath) || Option.isNone(source)) {
+      return { code: -1, lines: [], error: disabledMessage } satisfies ScriptResult;
+    }
+    const command = ChildProcess.make("/bin/bash", [scriptPath.value, ...args], {
+      cwd: source.value.repo,
+      env: scriptEnv(source.value.branch),
+      extendEnv: true,
+      stdout: "pipe",
+      stderr: "pipe",
     });
+    const lines: string[] = [];
+    let error: string | null = null;
+    return yield* Effect.scoped(
+      Effect.gen(function* () {
+        const handle = yield* spawner.spawn(command);
+        const toLines = (stream: typeof handle.stdout) =>
+          stream.pipe(Stream.decodeText(), Stream.splitLines);
+        const [, , exitCode] = yield* Effect.all(
+          [
+            Stream.runForEach(toLines(handle.stdout), (line) => {
+              lines.push(line);
+              return onLine?.(line) ?? Effect.void;
+            }),
+            Stream.runForEach(toLines(handle.stderr), (line) =>
+              Effect.sync(() => {
+                if (line.startsWith("ERROR ")) error = line.slice("ERROR ".length);
+              }),
+            ),
+            handle.exitCode,
+          ],
+          { concurrency: "unbounded" },
+        );
+        return { code: Number(exitCode), lines, error } satisfies ScriptResult;
+      }),
+    ).pipe(
+      Effect.catch((cause) =>
+        Effect.succeed({ code: -1, lines, error: error ?? cause.message } satisfies ScriptResult),
+      ),
+    );
+  });
 
   /** Claims the updater for one action; `null` when another action holds it. */
   const claim = <A>(action: "check" | "download" | "install", effect: Effect.Effect<A>) =>
     Ref.modify(activeRef, (active) => (active === null ? [true, action] : [false, active])).pipe(
       Effect.flatMap((claimed) =>
         claimed
-          ? effect.pipe(Effect.map(Option.some), Effect.ensuring(Ref.set(activeRef, null)))
+          ? effect.pipe(Effect.asSome, Effect.ensuring(Ref.set(activeRef, null)))
           : Effect.succeedNone,
       ),
     );
@@ -130,10 +155,11 @@ const make = Effect.gen(function* () {
     const ran = yield* claim(
       "check",
       Effect.gen(function* () {
+        const checkedAt = DateTime.formatIso(yield* DateTime.now);
         const previous = yield* update((state) => ({
           ...state,
           status: state.downloadedVersion === null ? "checking" : state.status,
-          checkedAt: new Date().toISOString(),
+          checkedAt,
           message: null,
           errorContext: null,
         }));
@@ -212,7 +238,10 @@ const make = Effect.gen(function* () {
       }));
       const sync = yield* runScript(["sync"]);
       if (sync.code === EXIT_CONFLICT) {
-        const repo = Option.match(source, { onNone: () => "", onSome: ({ repo }) => ` in ${repo}` });
+        const repo = Option.match(source, {
+          onNone: () => "",
+          onSome: ({ repo }) => ` in ${repo}`,
+        });
         yield* logWarning("fork update stopped on a merge conflict", { error: sync.error });
         yield* failDownload(
           `Update stopped: ${sync.error ?? "merge conflict"}. The merge was aborted; resolve it${repo}, commit, then retry.`,
@@ -224,14 +253,11 @@ const make = Effect.gen(function* () {
         return false;
       }
       yield* update((state) => ({ ...state, downloadPercent: 5 }));
-      const context = yield* Effect.context<never>();
       const build = yield* runScript(["build"], (line) => {
         const percent = Number(/^PROGRESS (\d+)/.exec(line)?.[1]);
-        if (Number.isFinite(percent)) {
-          void Effect.runPromiseWith(context)(
-            update((state) => ({ ...state, downloadPercent: percent })),
-          );
-        }
+        return Number.isFinite(percent)
+          ? update((state) => ({ ...state, downloadPercent: percent })).pipe(Effect.asVoid)
+          : Effect.void;
       });
       const app = field(build.lines, "APP")[0];
       const version = field(build.lines, "VERSION")[0];
@@ -264,12 +290,23 @@ const make = Effect.gen(function* () {
         ) {
           return false;
         }
-        // The installer outlives this process: it waits for the quit, swaps the app, relaunches.
-        NodeChildProcess.spawn("/bin/bash", [scriptPath.value, "install", app, String(process.pid)], {
-          detached: true,
-          stdio: "ignore",
-          env: process.env,
-        }).unref();
+        // The installer must outlive this app: nohup + & lets it wait for the quit, swap, relaunch.
+        const installer = ChildProcess.make(
+          "/bin/bash",
+          [
+            "-c",
+            'nohup /bin/bash "$0" install "$1" "$2" >"$3" 2>&1 &',
+            scriptPath.value,
+            app,
+            String(process.pid),
+            path.join(environment.logDir, "fork-install.log"),
+          ],
+          { stdout: "ignore", stderr: "ignore" },
+        );
+        const started = yield* Effect.scoped(
+          spawner.spawn(installer).pipe(Effect.flatMap((handle) => handle.exitCode)),
+        ).pipe(Effect.option);
+        if (Option.isNone(started)) return false;
         yield* electronApp.quit;
         return true;
       }),
@@ -303,30 +340,28 @@ const make = Effect.gen(function* () {
         Effect.forkScoped,
       );
     }),
-    setChannel: () => Ref.get(stateRef),
-    check: (reason) =>
-      check(reason).pipe(
-        Effect.flatMap((checked) =>
-          Ref.get(stateRef).pipe(Effect.map((state) => ({ checked, state }))),
-        ),
-      ),
+    setChannel: Effect.fn("ForkSourceUpdates.setChannel")(function* () {
+      return yield* Ref.get(stateRef);
+    }),
+    check: Effect.fn("ForkSourceUpdates.checkResult")(function* (reason: string) {
+      const checked = yield* check(reason);
+      return { checked, state: yield* Ref.get(stateRef) };
+    }),
     download: download.pipe(Effect.flatMap(actionResult)),
     install: install().pipe(Effect.flatMap(actionResult)),
-    installPrepared: (expectedVersion) =>
-      install(expectedVersion).pipe(
-        Effect.flatMap(actionResult),
-        Effect.map((result) => ({ ...result, failed: false })),
-      ),
+    installPrepared: Effect.fn("ForkSourceUpdates.installPrepared")(function* (
+      expectedVersion: string,
+    ) {
+      return { ...(yield* actionResult(yield* install(expectedVersion))), failed: false };
+    }),
   });
 });
 
 /** Fork builds update from source; every other build keeps the release updater. */
-export const layer = Layer.unwrap(
-  DesktopEnvironment.DesktopEnvironment.pipe(
-    Effect.map((environment) =>
-      isForkDesktopVersion(environment.appVersion)
-        ? Layer.effect(DesktopUpdates.DesktopUpdates, make)
-        : DesktopUpdates.layer,
-    ),
-  ),
+export const layer = Layer.effect(
+  DesktopUpdates.DesktopUpdates,
+  Effect.gen(function* () {
+    const environment = yield* DesktopEnvironment.DesktopEnvironment;
+    return isForkDesktopVersion(environment.appVersion) ? yield* make : yield* DesktopUpdates.make;
+  }),
 );
